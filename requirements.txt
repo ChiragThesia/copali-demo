@@ -192,7 +192,7 @@ spinners==0.0.24
 SQLAlchemy==2.0.21
 srsly==2.4.8
 starlette==0.27.0
-streamlit==1.28.2
+streamlit==1.37.0
 sympy==1.13.1
 tenacity==8.2.3
 termcolor==2.3.0
