@@ -1,7 +1,7 @@
 import streamlit as st
 from byaldi import RAGMultiModalModel
 import os
-tempfile
+import tempfile
 import time
 from pdf2image import convert_from_path
 from pdf2image.exceptions import PDFInfoNotInstalledError
@@ -10,7 +10,6 @@ import hashlib
 from transformers import Qwen2VLForConditionalGeneration, AutoTokenizer, AutoProcessor
 import torch
 from PIL import Image
-import os
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -47,7 +46,7 @@ def main():
     # Load Qwen2-VL model for multimodal understanding if not already loaded
     if 'qwen2vl_model' not in st.session_state:
         with st.spinner("Loading Qwen2-VL model for image and text understanding..."):
-            st.session_state.qwen2vl_model = Qwen2VLForConditionalGeneration.from_pretrained("Qwen/Qwen2-VL-7B-Instruct", torch_dtype="auto", device_map="auto")
+            st.session_state.qwen2vl_model = Qwen2VLForConditionalGeneration.from_pretrained("Qwen/Qwen2-VL-7B-Instruct", torch_dtype=torch.float16)
             st.session_state.qwen2vl_processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
         st.success("Qwen2-VL model loaded successfully!")
         logger.info("Qwen2-VL model loaded successfully!")
@@ -140,7 +139,8 @@ def main():
             if results:
                 st.write("### Search Results:")
                 logger.info("Search results found:")
-                extracted_text = ""
+                images_to_process = []
+
                 for result in results:
                     st.write(f"**Result Object**: {result}")
                     logger.info(f"Full Result: {result}")
@@ -149,65 +149,63 @@ def main():
                         page_num = result.page_num
                         try:
                             # Convert the specific page to an image with lower resolution to reduce memory usage
-                            pages = convert_from_path(st.session_state.file_path, dpi=100, first_page=page_num, last_page=page_num)
+                            pages = convert_from_path(st.session_state.file_path, dpi=50, first_page=page_num, last_page=page_num)
                             if pages:
-                                # Iterate over pages to display them all
                                 for page in pages:
                                     # Resize the image to further reduce memory consumption
-                                    resized_image = page.resize((800, 600))
+                                    resized_image = page.resize((400, 300))
                                     st.image(resized_image, caption=f"Page {page_num}", use_column_width=True)
-                                    
-                                    # Logging output to show process
-                                    logger.info("Processing image with Qwen2-VL for insight generation...")
-                                    st.write("Processing image with Qwen2-VL for insight generation...")
-                                    
-                                    # Use Qwen2-VL to generate insight from the page
-                                    messages = [
-                                        {
-                                            "role": "user",
-                                            "content": [
-                                                {"type": "image", "image": resized_image},
-                                                {"type": "text", "text": query}
-                                            ]
-                                        }
-                                    ]
-                                    # Prepare the input for Qwen2-VL
-                                    text = st.session_state.qwen2vl_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                                    inputs = st.session_state.qwen2vl_processor(
-                                        text=[text],
-                                        images=[resized_image],
-                                        padding=True,
-                                        return_tensors="pt"
-                                    )
-
-                                    # Ensure inputs are on the same device as the model
-                                    device = next(st.session_state.qwen2vl_model.parameters()).device
-                                    inputs = inputs.to(device)
-
-                                    # Generate response using Qwen2-VL
-                                    logger.info("Generating response using Qwen2-VL...")
-                                    st.write("Generating response using Qwen2-VL...")
-                                    
-                                    generated_ids = st.session_state.qwen2vl_model.generate(**inputs, max_new_tokens=128)
-                                    generated_ids_trimmed = [
-                                        out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-                                    ]
-                                    response = st.session_state.qwen2vl_processor.batch_decode(
-                                        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-                                    )[0]
-                                    extracted_text += response + "\n"
-
+                                    images_to_process.append(resized_image)
                         except PDFInfoNotInstalledError:
                             st.error("Poppler is not installed. Please install Poppler to continue.")
                             logger.error("Poppler is not installed. Unable to proceed.")
                         except Exception as e:
                             st.error(f"An error occurred while extracting page {page_num}: {e}")
                             logger.error(f"An error occurred while extracting page {page_num}: {e}")
-                
-                # Display the generated structured response
-                if extracted_text:
+
+                # Use Qwen2-VL to generate insights from the collected images
+                if images_to_process:
                     st.write("---")
                     st.subheader("Generated Response")
+                    extracted_text = ""
+                    logger.info("Processing images in bulk through Qwen2-VL...")
+                    
+                    for image in images_to_process:
+                        messages = [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "image", "image": image},
+                                    {"type": "text", "text": query}
+                                ]
+                            }
+                        ]
+                        # Prepare the input for Qwen2-VL
+                        text = st.session_state.qwen2vl_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                        inputs = st.session_state.qwen2vl_processor(
+                            text=[text],
+                            images=[image],
+                            padding=True,
+                            return_tensors="pt"
+                        )
+
+                        # Ensure inputs are on CPU since we're using Streamlit's environment
+                        inputs = inputs.to('cpu')
+
+                        # Generate response using Qwen2-VL with reduced max tokens
+                        logger.info("Generating response using Qwen2-VL...")
+                        st.write("Generating response using Qwen2-VL...")
+
+                        generated_ids = st.session_state.qwen2vl_model.generate(**inputs, max_new_tokens=64)  # Reduce tokens
+                        generated_ids_trimmed = [
+                            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+                        ]
+                        response = st.session_state.qwen2vl_processor.batch_decode(
+                            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                        )[0]
+                        extracted_text += response + "\n"
+
+                    # Display the generated structured response
                     st.write(extracted_text)
             else:
                 st.write("No results found for your query.")
