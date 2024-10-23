@@ -1,15 +1,15 @@
 import streamlit as st
-from byaldi import RAGMultiModalModel
 import os
+from openai import OpenAI
 import tempfile
 import time
 from pdf2image import convert_from_path
 from pdf2image.exceptions import PDFInfoNotInstalledError
 import logging
 import hashlib
-from transformers import Qwen2VLForConditionalGeneration, AutoTokenizer, AutoProcessor
-import torch
+import pytesseract
 from PIL import Image
+from byaldi import RAGMultiModalModel
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -26,10 +26,53 @@ def get_document_hash(file_path):
         hasher.update(buf)
     return hasher.hexdigest()
 
+def call_gpt4(api_key, content):
+    """Calls the OpenAI GPT-4 API to generate structured instructions."""
+    client = OpenAI(api_key=api_key)
+    messages = [
+        {
+            "role": "user",
+            "content": f"""
+            The following is extracted from a gateway manual. Please provide step-by-step instructions based on this text. Respond with concise and clear procedural steps:
+            {content}
+            """
+        }
+    ]
+    
+    # Print the message dictionary being sent to GPT-4
+    logger.info(f"Message context sent to GPT-4: {messages}")
+    st.write("### GPT-4 Context Sent:")
+    st.json(messages)  # Display the context as JSON in the Streamlit app
+
+    # Call the GPT-4 API
+    response = client.chat.completions.create(
+        messages=messages,
+        model="gpt-4",
+    )
+
+    # Print the entire GPT-4 response for inspection
+    logger.info(f"GPT-4 API Response: {response}")
+    st.write("### GPT-4 Raw Response:")
+    st.json(response)  # Display the raw response as JSON in the Streamlit app
+
+    # Access the correct content in the response
+    try:
+        return response.choices[0].message.content.strip()  # Corrected access to message content
+    except Exception as e:
+        logger.error(f"Error parsing GPT-4 response: {e}")
+        st.error(f"Error parsing GPT-4 response: {e}")
+        return "An error occurred."
+
 def main():
     # Streamlit app title
-    st.title("Document Query App with Qwen2-VL Integration")
-    st.write("Upload a document and query it using Qwen2-VL's multimodal capabilities.")
+    st.title("Document Query App with Colpali, Tesseract OCR, and GPT-4")
+
+    # Get OpenAI API key from the user
+    openai_api_key = st.text_input("Enter your OpenAI API key:", type="password")
+
+    if not openai_api_key:
+        st.warning("Please provide your OpenAI API key to proceed.")
+        return
 
     # Load the Colpali model once and store in session state
     if 'model' not in st.session_state:
@@ -42,14 +85,6 @@ def main():
 
     # Assign the model from session state
     model = st.session_state.model
-
-    # Load Qwen2-VL model for multimodal understanding if not already loaded
-    if 'qwen2vl_model' not in st.session_state:
-        with st.spinner("Loading Qwen2-VL model for image and text understanding..."):
-            st.session_state.qwen2vl_model = Qwen2VLForConditionalGeneration.from_pretrained("Qwen/Qwen2-VL-7B-Instruct", torch_dtype=torch.float16)
-            st.session_state.qwen2vl_processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
-        st.success("Qwen2-VL model loaded successfully!")
-        logger.info("Qwen2-VL model loaded successfully!")
 
     # Create a persistent temporary directory for the session
     if 'temp_dir' not in st.session_state:
@@ -139,77 +174,43 @@ def main():
             if results:
                 st.write("### Search Results:")
                 logger.info("Search results found:")
-                images_to_process = []
+                
+                full_extracted_text = ""  # To store combined text for GPT-4
 
                 for result in results:
-                    st.write(f"**Result Object**: {result}")
-                    logger.info(f"Full Result: {result}")
-                    # Extract and display the page from the PDF
-                    if hasattr(result, 'page_num'):
+                    try:
                         page_num = result.page_num
-                        try:
-                            # Convert the specific page to an image with lower resolution to reduce memory usage
-                            pages = convert_from_path(st.session_state.file_path, dpi=50, first_page=page_num, last_page=page_num)
-                            if pages:
-                                for page in pages:
-                                    # Resize the image to further reduce memory consumption
-                                    resized_image = page.resize((400, 300))
-                                    st.image(resized_image, caption=f"Page {page_num}", use_column_width=True)
-                                    images_to_process.append(resized_image)
-                        except PDFInfoNotInstalledError:
-                            st.error("Poppler is not installed. Please install Poppler to continue.")
-                            logger.error("Poppler is not installed. Unable to proceed.")
-                        except Exception as e:
-                            st.error(f"An error occurred while extracting page {page_num}: {e}")
-                            logger.error(f"An error occurred while extracting page {page_num}: {e}")
+                    except AttributeError:
+                        st.error("Result object does not have 'page_num' attribute.")
+                        logger.error("Result object does not have 'page_num' attribute.")
+                        continue
 
-                # Use Qwen2-VL to generate insights from the collected images
-                if images_to_process:
-                    st.write("---")
-                    st.subheader("Generated Response")
-                    extracted_text = ""
-                    logger.info("Processing images in bulk through Qwen2-VL...")
-                    
-                    for image in images_to_process:
-                        messages = [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "image", "image": image},
-                                    {"type": "text", "text": query}
-                                ]
-                            }
-                        ]
-                        # Prepare the input for Qwen2-VL
-                        text = st.session_state.qwen2vl_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                        inputs = st.session_state.qwen2vl_processor(
-                            text=[text],
-                            images=[image],
-                            padding=True,
-                            return_tensors="pt"
-                        )
+                    st.write(f"Processing page {page_num}...")
+                    logger.info(f"Processing page {page_num}...")
 
-                        # Ensure inputs are on CPU since we're using Streamlit's environment
-                        inputs = inputs.to('cpu')
+                    try:
+                        # Convert the specific page to an image with lower resolution to reduce memory usage
+                        pages = convert_from_path(st.session_state.file_path, dpi=50, first_page=page_num, last_page=page_num)
+                        if pages:
+                            for page in pages:
+                                st.image(page, caption=f"Page {page_num}", use_column_width=True)
 
-                        # Generate response using Qwen2-VL with reduced max tokens
-                        logger.info("Generating response using Qwen2-VL...")
-                        st.write("Generating response using Qwen2-VL...")
+                                # Extract text from the image using Tesseract OCR
+                                text = pytesseract.image_to_string(page)
+                                full_extracted_text += f"Page {page_num}: {text}\n"
 
-                        generated_ids = st.session_state.qwen2vl_model.generate(**inputs, max_new_tokens=64)  # Reduce tokens
-                        generated_ids_trimmed = [
-                            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-                        ]
-                        response = st.session_state.qwen2vl_processor.batch_decode(
-                            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-                        )[0]
-                        extracted_text += response + "\n"
-
-                    # Display the generated structured response
-                    st.write(extracted_text)
-            else:
-                st.write("No results found for your query.")
-                logger.info("No results found for the query.")
+                    except PDFInfoNotInstalledError:
+                        st.error("Poppler is not installed. Please install Poppler to continue.")
+                        logger.error("Poppler is not installed. Unable to proceed.")
+                    except Exception as e:
+                        st.error(f"An error occurred while processing page {page_num}: {e}")
+                        logger.error(f"An error occurred while processing page {page_num}: {e}")
+                
+                # Call GPT-4 with the combined text and display the output
+                st.write("### GPT-4 Generated Instructions:")
+                with st.spinner("Generating instructions with GPT-4..."):
+                    gpt_response = call_gpt4(openai_api_key, full_extracted_text)
+                    st.write(gpt_response)
 
 if __name__ == "__main__":
     main()
