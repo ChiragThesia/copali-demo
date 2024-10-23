@@ -65,7 +65,7 @@ def call_gpt4(api_key, content):
 
 def main():
     # Streamlit app title
-    st.title("Document Query App with Colpali, Tesseract OCR, and GPT-4")
+    st.title("Colpali demo SureSteps")
 
     # Get OpenAI API key from the user
     openai_api_key = st.text_input("Enter your OpenAI API key:", type="password")
