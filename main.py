@@ -6,211 +6,308 @@ import time
 from pdf2image import convert_from_path
 from pdf2image.exceptions import PDFInfoNotInstalledError
 import logging
+import logging.config
 import hashlib
-import pytesseract
 from PIL import Image
+from huggingface_hub import InferenceClient
+from io import BytesIO
 from byaldi import RAGMultiModalModel
+import shutil
+from huggingface_hub import InferenceClient
+from io import BytesIO
 
-# Configure logging
+# Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Disable tokenizers parallelism to avoid deadlock issues
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# Hugging Face API URL
+API_URL = "https://api-inference.huggingface.co/models/meta-llama/Llama-3.2-11B-Vision-Instruct"
+
+def configure_logging():
+    """Configure logging settings"""
+    logging_config = {
+        'version': 1,
+        'disable_existing_loggers': False,
+        'formatters': {
+            'standard': {
+                'format': '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            },
+        },
+        'handlers': {
+            'default': {
+                'level': 'INFO',
+                'formatter': 'standard',
+                'class': 'logging.StreamHandler',
+            },
+        },
+        'loggers': {
+            '': {
+                'handlers': ['default'],
+                'level': 'INFO',
+                'propagate': True
+            }
+        }
+    }
+    logging.config.dictConfig(logging_config)
+    return logging.getLogger(__name__)
+
 def get_document_hash(file_path):
-    # Generate a hash for the document to identify it uniquely
     hasher = hashlib.sha256()
     with open(file_path, 'rb') as f:
         buf = f.read()
         hasher.update(buf)
     return hasher.hexdigest()
 
-def call_gpt4(api_key, content):
-    """Calls the OpenAI GPT-4 API to generate structured instructions."""
-    client = OpenAI(api_key=api_key)
-    messages = [
-        {
-            "role": "user",
-            "content": f"""
-            The following is extracted from a gateway manual. Please provide step-by-step instructions based on this text. Respond with concise and clear procedural steps:
-            {content}
-            """
-        }
-    ]
-    
-    # Print the message dictionary being sent to GPT-4
-    logger.info(f"Message context sent to GPT-4: {messages}")
-    st.write("### GPT-4 Context Sent:")
-    st.json(messages)  # Display the context as JSON in the Streamlit app
+def initialize_colpali_model():
+    if 'model' not in st.session_state:
+        with st.spinner("Initializing the Colpali model..."):
+            logger.info("Initializing the Colpali model...")
+            time.sleep(1)  # Simulate loading time
+            st.session_state.model = RAGMultiModalModel.from_pretrained("vidore/colpali")
+        st.success("Colpali initialized successfully!")
+        logger.info("Colpali initialized successfully!")
+    return st.session_state.model
 
-    # Call the GPT-4 API
+def save_uploaded_file(uploaded_file):
+    # Clear any existing temp directories and files
+    if 'temp_dir' in st.session_state:
+        try:
+            shutil.rmtree(st.session_state.temp_dir, ignore_errors=True)
+        except Exception as e:
+            logger.error(f"Error cleaning temp directory: {e}")
+    
+    # Create new temp directory
+    st.session_state.temp_dir = tempfile.mkdtemp()
+    
+    # Save the new file
+    file_path = os.path.join(st.session_state.temp_dir, uploaded_file.name)
+    with open(file_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    
+    st.session_state.file_path = file_path
+    st.session_state.document_hash = get_document_hash(file_path)
+    logger.info(f"File saved to temporary directory: {file_path}")
+    return file_path
+
+def clean_index_directory(index_path):
+    """Clean up existing index directory and .byaldi directory"""
+    # Clean persistent_indexes directory
+    if os.path.exists(index_path):
+        try:
+            shutil.rmtree(index_path)
+            logger.info(f"Cleaned up existing index at: {index_path}")
+        except Exception as e:
+            logger.error(f"Error cleaning up index directory: {e}")
+    
+    # Clean .byaldi directory
+    byaldi_dir = os.path.join(os.getcwd(), '.byaldi')
+    if os.path.exists(byaldi_dir):
+        try:
+            shutil.rmtree(byaldi_dir)
+            logger.info(f"Cleaned up .byaldi directory at: {byaldi_dir}")
+        except Exception as e:
+            logger.error(f"Error cleaning up .byaldi directory: {e}")
+
+def index_document(file_path, model):
+    if not file_path.endswith(('.pdf', '.doc', '.docx')):
+        raise ValueError("Unsupported input type: Only PDF and DOC/DOCX files are supported for indexing.")
+    
+    document_hash = st.session_state.document_hash
+    index_dir = "persistent_indexes"
+    os.makedirs(index_dir, exist_ok=True)
+    index_path = os.path.join(index_dir, f"index_{document_hash}")
+
+    # Clean up existing indexes
+    clean_index_directory(index_path)
+
+    with st.spinner("Indexing the document, please wait..."):
+        logger.info("Indexing the document...")
+        try:
+            model.index(
+                input_path=file_path,
+                index_name=index_path,
+                store_collection_with_index=False,
+                overwrite=True
+            )
+            st.success("Document indexed successfully!")
+            logger.info("Document indexed successfully!")
+            st.session_state.indexed = True
+        except Exception as e:
+            logger.error(f"Error during indexing: {e}")
+            st.error(f"Error during indexing: {e}")
+            st.session_state.indexed = False
+
+def call_gpt4o(api_key, content, image_descriptions_dict):
+    client = OpenAI(api_key=api_key)
+    
+    formatted_descriptions = "\n\n".join([
+        f"Page {page_num}:\n"
+        f"Location: {info['location']}\n"
+        f"Description: {info['description']}"
+        for page_num, info in image_descriptions_dict.items()
+    ])
+    
+    enhanced_content = f"""
+    User Query: {content}
+    
+    Available Technical Diagrams and Images:
+    {formatted_descriptions}
+    
+    Based on the above query and the technical diagrams found in the documentation, 
+    please provide detailed step-by-step installation instructions. Reference specific 
+    diagrams by their page numbers where relevant.
+    """
+    
+    messages = [{"role": "user", "content": enhanced_content}]
+    logger.info("Sending structured content to GPT-4...")
+    st.write("### Enhanced Content Sent to GPT-4:")
+    st.json(image_descriptions_dict)
+    
     response = client.chat.completions.create(
         messages=messages,
-        model="gpt-4",
+        model="gpt-4o"
     )
-
-    # Print the entire GPT-4 response for inspection
-    logger.info(f"GPT-4 API Response: {response}")
-    st.write("### GPT-4 Raw Response:")
-    st.json(response)  # Display the raw response as JSON in the Streamlit app
-
-    # Access the correct content in the response
+    
     try:
-        return response.choices[0].message.content.strip()  # Corrected access to message content
+        return response.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"Error parsing GPT-4 response: {e}")
         st.error(f"Error parsing GPT-4 response: {e}")
         return "An error occurred."
 
+def perform_search(query, model):
+    if st.session_state.indexed:
+        with st.spinner("Performing search, please wait..."):
+            logger.info(f"Performing search with query: {query}")
+            try:
+                return model.search(query, k=5)
+            except Exception as e:
+                logger.error(f"Error during search: {e}")
+                st.error(f"Error during search: {e}")
+                return []
+    else:
+        st.error("Document not indexed. Please upload and index a document first.")
+        return []
+
+def extract_images_from_pdf(pdf_path, page_numbers):
+    """Extract images from specific PDF pages with location metadata."""
+    images_dict = {}
+    
+    for page_num in page_numbers:
+        try:
+            pages = convert_from_path(pdf_path, dpi=200, first_page=page_num, last_page=page_num)
+            if pages:
+                for page in pages:
+                    # Store both the image and its location metadata
+                    images_dict[page_num] = {
+                        'image': page,
+                        'location': f'Page {page_num}',
+                        'description': None  # Will be filled by Hugging Face Vision
+                    }
+                    
+        except Exception as e:
+            logger.error(f"Error processing page {page_num}: {e}")
+            continue
+    
+    return images_dict
+
+def call_huggingface_vision(api_key, images_dict):
+    """Process images using Hugging Face's InferenceClient for captioning."""
+    client = InferenceClient(api_key=api_key)
+    
+    for page_num, info in images_dict.items():
+        image = info['image']
+
+        logger.info(f"Processing image from page {page_num} with Hugging Face Vision...")
+        
+        try:
+            # Convert the PIL image to JPEG format
+            buffered = BytesIO()
+            image.convert("RGB").save(buffered, format="JPEG")
+            buffered.seek(0)
+            
+            # Use the client.image_to_text method to generate image captions
+            caption = client.image_to_text(buffered)
+            images_dict[page_num]['description'] = caption
+        
+        except Exception as e:
+            logger.error(f"Error processing image on page {page_num}: {e}")
+            images_dict[page_num]['description'] = f"Error processing image: {str(e)}"
+            continue
+
+    return images_dict
+
 def main():
-    # Streamlit app title
     st.title("Colpali demo SureSteps")
 
-    # Get OpenAI API key from the user
-    openai_api_key = st.text_input("Enter your OpenAI API key:", type="password")
+    # Initialize session state
+    if 'indexed' not in st.session_state:
+        st.session_state.indexed = False
 
-    if not openai_api_key:
-        st.warning("Please provide your OpenAI API key to proceed.")
+    # API key inputs
+    openai_api_key = st.text_input("Enter your OpenAI API key:", type="password")
+    huggingface_api_key = st.text_input("Enter your Hugging Face API key:", type="password")
+    
+    if not openai_api_key or not huggingface_api_key:
+        st.warning("Please provide both OpenAI and Hugging Face API keys to proceed.")
         return
 
-    # Load the Colpali model once and store in session state
-    if 'model' not in st.session_state:
-        with st.spinner("Initializing the Colpali model..."):
-            logger.info("Initializing the Colpali model...")
-            time.sleep(1)  # Simulate some loading time
-            st.session_state.model = RAGMultiModalModel.from_pretrained("vidore/colpali")
-        st.success("Colpali initialized successfully!")
-        logger.info("Colpali initialized successfully!")
+    logger = configure_logging()
+    
+    # Initialize Colpali once at the start
+    model = initialize_colpali_model()
+    
+    # Clean up directories
+    index_dir = "persistent_indexes"
+    if os.path.exists(index_dir):
+        shutil.rmtree(index_dir)
+    os.makedirs(index_dir, exist_ok=True)
+    
+    byaldi_dir = os.path.join(os.getcwd(), '.byaldi')
+    if os.path.exists(byaldi_dir):
+        shutil.rmtree(byaldi_dir)
 
-    # Assign the model from session state
-    model = st.session_state.model
-
-    # Create a persistent temporary directory for the session
-    if 'temp_dir' not in st.session_state:
-        st.session_state.temp_dir = tempfile.mkdtemp()
-        st.session_state.file_path = None
-
-    # Uploading the document if not already indexed
-    if 'uploaded_file' not in st.session_state and ('indexed' not in st.session_state or not st.session_state.indexed):
-        uploaded_file = st.file_uploader("Upload a PDF or DOC file", type=["pdf", "doc", "docx"])
-        if uploaded_file is not None:
-            st.session_state.uploaded_file = uploaded_file
-            st.session_state.indexed = False  # Ensure indexed state is reset for new uploads
-
-            # Save the uploaded file to the persistent temporary directory
-            file_path = os.path.join(st.session_state.temp_dir, uploaded_file.name)
-            with open(file_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            st.session_state.file_path = file_path
-            logger.info(f"File saved to temporary directory: {file_path}")
-
-            # Generate document hash to identify it uniquely
-            document_hash = get_document_hash(file_path)
-            st.session_state.document_hash = document_hash
-
-    # Proceed with indexing if a file has been uploaded but not indexed yet
-    if 'uploaded_file' in st.session_state and not st.session_state.indexed:
-        file_path = st.session_state.file_path
-        if file_path and os.path.exists(file_path):
-            document_hash = st.session_state.document_hash
-            index_dir = "persistent_indexes"
-            os.makedirs(index_dir, exist_ok=True)
-            index_path = os.path.join(index_dir, f"index_{document_hash}")
-
-            # Check if index already exists
-            if os.path.exists(index_path):
-                logger.info("Loading existing index...")
-                st.session_state.indexed = True
-                st.success("Document index loaded successfully! You can now enter your query below.")
-            else:
-                # Step-wise progress for indexing the document
-                try:
-                    # Ensure the uploaded file is a supported type for indexing
-                    if not file_path.endswith(('.pdf', '.doc', '.docx')):
-                        raise ValueError("Unsupported input type: Only PDF and DOC/DOCX files are supported for indexing.")
-                    
-                    with st.spinner("Indexing the document, please wait..."):
-                        logger.info("Indexing the document...")
-                        time.sleep(2)  # Simulate indexing time
-                        model.index(
-                            input_path=file_path,  # Index the specific file directly
-                            index_name=index_path,
-                            store_collection_with_index=False,
-                            overwrite=True
-                        )
-                    st.success("Document indexed successfully! You can now enter your query below.")
-                    logger.info("Document indexed successfully!")
-                    st.session_state.indexed = True
-                
-                except PDFInfoNotInstalledError:
-                    st.error("Poppler is not installed. Please install Poppler to continue.")
-                    logger.error("Poppler is not installed. Unable to proceed.")
-                    st.session_state.indexed = False
-                    return
-                except Exception as e:
-                    st.error(f"An unexpected error occurred: {e}")
-                    logger.error(f"An unexpected error occurred: {e}")
-                    st.session_state.indexed = False
-                    return
+    uploaded_file = st.file_uploader("Upload a PDF or DOC file", type=["pdf", "doc", "docx"])
+    if uploaded_file:
+        if not st.session_state.indexed:
+            file_path = save_uploaded_file(uploaded_file)
+            index_document(file_path, model)
         else:
-            st.error("The uploaded file is no longer available. Please upload it again.")
-            st.session_state.indexed = False
-            return
+            st.write("Document is already indexed.")
 
-    # Query input from the user after document indexing
-    if st.session_state.get('indexed', False):
-        st.write("---")
-        st.subheader("Search the Document")
+    if st.session_state.indexed:
         query = st.text_input("Enter your search query here:")
-
         if st.button("Search") and query:
-            with st.spinner("Performing search, please wait..."):
-                logger.info(f"Performing search with query: {query}")
-                time.sleep(1)  # Simulate searching time
-                results = model.search(query, k=5)
-
-            # Display the search results and extract the relevant pages
+            # Step 1: Get relevant pages from Colpali
+            results = perform_search(query, model)
+            
             if results:
-                st.write("### Search Results:")
-                logger.info("Search results found:")
+                # Step 2: Extract page numbers
+                page_numbers = [result.page_num for result in results if hasattr(result, 'page_num')]
                 
-                full_extracted_text = ""  # To store combined text for GPT-4
-
-                for result in results:
-                    try:
-                        page_num = result.page_num
-                    except AttributeError:
-                        st.error("Result object does not have 'page_num' attribute.")
-                        logger.error("Result object does not have 'page_num' attribute.")
-                        continue
-
-                    st.write(f"Processing page {page_num}...")
-                    logger.info(f"Processing page {page_num}...")
-
-                    try:
-                        # Convert the specific page to an image with lower resolution to reduce memory usage
-                        pages = convert_from_path(st.session_state.file_path, dpi=50, first_page=page_num, last_page=page_num)
-                        if pages:
-                            for page in pages:
-                                st.image(page, caption=f"Page {page_num}", use_column_width=True)
-
-                                # Extract text from the image using Tesseract OCR
-                                text = pytesseract.image_to_string(page)
-                                full_extracted_text += f"Page {page_num}: {text}\n"
-
-                    except PDFInfoNotInstalledError:
-                        st.error("Poppler is not installed. Please install Poppler to continue.")
-                        logger.error("Poppler is not installed. Unable to proceed.")
-                    except Exception as e:
-                        st.error(f"An error occurred while processing page {page_num}: {e}")
-                        logger.error(f"An error occurred while processing page {page_num}: {e}")
+                # Step 3: Extract images from those pages with metadata
+                st.write("### Extracting Images from PDF...")
+                images_dict = extract_images_from_pdf(st.session_state.file_path, page_numbers)
                 
-                # Call GPT-4 with the combined text and display the output
-                st.write("### GPT-4 Generated Instructions:")
-                with st.spinner("Generating instructions with GPT-4..."):
-                    gpt_response = call_gpt4(openai_api_key, full_extracted_text)
-                    st.write(gpt_response)
+                if images_dict:
+                    # Display original images
+                    st.write("### Original Images:")
+                    for page_num, info in images_dict.items():
+                        st.image(info['image'], caption=f"Page {page_num}", use_column_width=True)
+                    
+                    # Step 4: Get image descriptions from Hugging Face
+                    st.write("### Generating Image Descriptions...")
+                    images_dict = call_huggingface_vision(huggingface_api_key, images_dict)
+                    
+                    # Step 5: Generate installation instructions with GPT-4o
+                    st.write("### Generating Installation Instructions...")
+                    installation_instructions = call_gpt4o(openai_api_key, query, images_dict)
+                    
+                    st.write("### Final Installation Instructions:")
+                    st.write(installation_instructions)
 
 if __name__ == "__main__":
     main()
